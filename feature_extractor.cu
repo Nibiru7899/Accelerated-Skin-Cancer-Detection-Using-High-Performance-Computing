@@ -17,20 +17,20 @@
 
 namespace fs = std::filesystem;
 
-#define CHECK_CUDA(call)                                                                       \
-    do {                                                                                        \
-        cudaError_t status = (call);                                                            \
-        if (status != cudaSuccess) {                                                            \
-            throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(status)); \
-        }                                                                                       \
+#define CHECK_CUDA(call)                                                                       
+    do {                                                                                        
+        cudaError_t status = (call);                                                            
+        if (status != cudaSuccess) {                                                            
+            throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(status)); 
+        }                                                                                       
     } while (false)
 
-#define CHECK_CUDNN(call)                                                                         \
-    do {                                                                                          \
-        cudnnStatus_t status = (call);                                                            \
-        if (status != CUDNN_STATUS_SUCCESS) {                                                     \
-            throw std::runtime_error(std::string("cuDNN error: ") + cudnnGetErrorString(status)); \
-        }                                                                                         \
+#define CHECK_CUDNN(call)                                                                         
+    do {                                                                                          
+        cudnnStatus_t status = (call);                                                            
+        if (status != CUDNN_STATUS_SUCCESS) {                                                     
+            throw std::runtime_error(std::string("cuDNN error: ") + cudnnGetErrorString(status)); 
+        }                                                                                         
     } while (false)
 
 struct Sample {
@@ -167,4 +167,5 @@ std::string relative_or_absolute(const fs::path &target, const fs::path &base) {
 
 // NOTE: This is Part 1 of the feature extractor
 // Part 2 should contain the main() function with CUDA/cuDNN implementation
+
 // Merge both parts to create the complete feature_extractor_cudnn.cu file
