@@ -165,4 +165,348 @@ std::string relative_or_absolute(const fs::path &target, const fs::path &base) {
 
 }  // namespace
 
-// This is Part 1 of the feature extractor
+int main(int argc, char **argv) {
+    try {
+        std::string processed_root = "data_processed";
+        std::string features_root = "data_features";
+        int device_id = 0;
+
+        if (argc >= 2) {
+            processed_root = argv[1];
+        }
+        if (argc >= 3) {
+            features_root = argv[2];
+        }
+        if (argc >= 4) {
+            device_id = std::stoi(argv[3]);
+        }
+
+        CHECK_CUDA(cudaSetDevice(device_id));
+
+        auto samples = enumerate_processed(processed_root);
+        if (samples.empty()) {
+            std::cerr << "No processed samples found under " << processed_root << "\n";
+            return 1;
+        }
+
+        fs::create_directories(features_root);
+
+        const int batch = 1;
+        const int in_channels = 3;
+        const int in_height = 224;
+        const int in_width = 224;
+        const int conv1_out_channels = 16;
+        const int conv2_out_channels = 32;
+        const int kernel_size = 3;
+
+        const int pool_window = 2;
+        const int pool_stride = 2;
+
+        const int pool1_height = in_height / 2;   // 112
+        const int pool1_width = in_width / 2;     // 112
+        const int pool2_height = pool1_height / 2;  // 56
+        const int pool2_width = pool1_width / 2;    // 56
+
+        const size_t input_elems = static_cast<size_t>(batch) * in_channels * in_height * in_width;
+        const size_t conv1_elems = static_cast<size_t>(batch) * conv1_out_channels * in_height * in_width;
+        const size_t pool1_elems = static_cast<size_t>(batch) * conv1_out_channels * pool1_height * pool1_width;
+        const size_t conv2_elems = static_cast<size_t>(batch) * conv2_out_channels * pool1_height * pool1_width;
+        const size_t pool2_elems = static_cast<size_t>(batch) * conv2_out_channels * pool2_height * pool2_width;
+
+        float *d_input = nullptr;
+        float *d_conv1_out = nullptr;
+        float *d_pool1_out = nullptr;
+        float *d_conv2_out = nullptr;
+        float *d_pool2_out = nullptr;
+        float *d_workspace = nullptr;
+
+        CHECK_CUDA(cudaMalloc(&d_input, input_elems * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_conv1_out, conv1_elems * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_pool1_out, pool1_elems * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_conv2_out, conv2_elems * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_pool2_out, pool2_elems * sizeof(float)));
+
+        // Weight and bias buffers
+        std::vector<float> h_conv1_weights(conv1_out_channels * in_channels * kernel_size * kernel_size);
+        std::vector<float> h_conv2_weights(conv2_out_channels * conv1_out_channels * kernel_size * kernel_size);
+        std::vector<float> h_conv1_bias(conv1_out_channels, 0.0f);
+        std::vector<float> h_conv2_bias(conv2_out_channels, 0.0f);
+        initialise_conv_weights(h_conv1_weights, conv1_out_channels, in_channels, kernel_size);
+        initialise_conv_weights(h_conv2_weights, conv2_out_channels, conv1_out_channels, kernel_size);
+
+        float *d_conv1_weights = nullptr;
+        float *d_conv2_weights = nullptr;
+        float *d_conv1_bias = nullptr;
+        float *d_conv2_bias = nullptr;
+
+        CHECK_CUDA(cudaMalloc(&d_conv1_weights, h_conv1_weights.size() * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_conv2_weights, h_conv2_weights.size() * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_conv1_bias, h_conv1_bias.size() * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_conv2_bias, h_conv2_bias.size() * sizeof(float)));
+
+        CHECK_CUDA(cudaMemcpy(d_conv1_weights, h_conv1_weights.data(),
+                              h_conv1_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_conv2_weights, h_conv2_weights.data(),
+                              h_conv2_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_conv1_bias, h_conv1_bias.data(),
+                              h_conv1_bias.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_conv2_bias, h_conv2_bias.data(),
+                              h_conv2_bias.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+        cudnnHandle_t cudnn;
+        CHECK_CUDNN(cudnnCreate(&cudnn));
+
+        cudnnTensorDescriptor_t input_desc;
+        cudnnTensorDescriptor_t conv1_out_desc;
+        cudnnTensorDescriptor_t pool1_out_desc;
+        cudnnTensorDescriptor_t conv2_out_desc;
+        cudnnTensorDescriptor_t pool2_out_desc;
+        cudnnFilterDescriptor_t conv1_filter_desc;
+        cudnnFilterDescriptor_t conv2_filter_desc;
+        cudnnConvolutionDescriptor_t conv1_desc;
+        cudnnConvolutionDescriptor_t conv2_desc;
+        cudnnTensorDescriptor_t conv1_bias_desc;
+        cudnnTensorDescriptor_t conv2_bias_desc;
+        cudnnActivationDescriptor_t relu_desc;
+        cudnnPoolingDescriptor_t pool_desc;
+
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&input_desc));
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&conv1_out_desc));
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&pool1_out_desc));
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&conv2_out_desc));
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&pool2_out_desc));
+        CHECK_CUDNN(cudnnCreateFilterDescriptor(&conv1_filter_desc));
+        CHECK_CUDNN(cudnnCreateFilterDescriptor(&conv2_filter_desc));
+        CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv1_desc));
+        CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&conv2_desc));
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&conv1_bias_desc));
+        CHECK_CUDNN(cudnnCreateTensorDescriptor(&conv2_bias_desc));
+        CHECK_CUDNN(cudnnCreateActivationDescriptor(&relu_desc));
+        CHECK_CUDNN(cudnnCreatePoolingDescriptor(&pool_desc));
+
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                               batch, in_channels, in_height, in_width));
+
+        CHECK_CUDNN(cudnnSetFilter4dDescriptor(conv1_filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+                                               conv1_out_channels, in_channels, kernel_size, kernel_size));
+        CHECK_CUDNN(cudnnSetFilter4dDescriptor(conv2_filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW,
+                                               conv2_out_channels, conv1_out_channels, kernel_size, kernel_size));
+
+        CHECK_CUDNN(cudnnSetConvolution2dDescriptor(conv1_desc,
+                                                    /*pad_h*/ 1, /*pad_w*/ 1,
+                                                    /*stride_h*/ 1, /*stride_w*/ 1,
+                                                    /*dilation_h*/ 1, /*dilation_w*/ 1,
+                                                    CUDNN_CONVOLUTION, CUDNN_DATA_FLOAT));
+        CHECK_CUDNN(cudnnSetConvolution2dDescriptor(conv2_desc,
+                                                    1, 1,
+                                                    1, 1,
+                                                    1, 1,
+                                                    CUDNN_CONVOLUTION, CUDNN_DATA_FLOAT));
+
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(conv1_out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                               batch, conv1_out_channels, in_height, in_width));
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(pool1_out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                               batch, conv1_out_channels, pool1_height, pool1_width));
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(conv2_out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                               batch, conv2_out_channels, pool1_height, pool1_width));
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(pool2_out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                               batch, conv2_out_channels, pool2_height, pool2_width));
+
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(conv1_bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                               1, conv1_out_channels, 1, 1));
+        CHECK_CUDNN(cudnnSetTensor4dDescriptor(conv2_bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                               1, conv2_out_channels, 1, 1));
+
+        CHECK_CUDNN(cudnnSetActivationDescriptor(relu_desc, CUDNN_ACTIVATION_RELU,
+                                                 CUDNN_PROPAGATE_NAN, 0.0));
+
+        CHECK_CUDNN(cudnnSetPooling2dDescriptor(pool_desc, CUDNN_POOLING_MAX, CUDNN_NOT_PROPAGATE_NAN,
+                                                pool_window, pool_window,
+                                                0, 0,
+                                                pool_stride, pool_stride));
+
+        cudnnConvolutionFwdAlgoPerf_t conv1_perf;
+        cudnnConvolutionFwdAlgoPerf_t conv2_perf;
+        int returned = 0;
+
+        CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm_v7(cudnn, input_desc, conv1_filter_desc, conv1_desc,
+                                                           conv1_out_desc, 1, &returned, &conv1_perf));
+        CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm_v7(cudnn, pool1_out_desc, conv2_filter_desc, conv2_desc,
+                                                           conv2_out_desc, 1, &returned, &conv2_perf));
+
+        size_t workspace_bytes = 0;
+        size_t conv1_ws = 0;
+        size_t conv2_ws = 0;
+        CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(cudnn, input_desc, conv1_filter_desc, conv1_desc,
+                                                             conv1_out_desc, conv1_perf.algo, &conv1_ws));
+        CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(cudnn, pool1_out_desc, conv2_filter_desc, conv2_desc,
+                                                             conv2_out_desc, conv2_perf.algo, &conv2_ws));
+        workspace_bytes = std::max(conv1_ws, conv2_ws);
+        if (workspace_bytes > 0) {
+            CHECK_CUDA(cudaMalloc(&d_workspace, workspace_bytes));
+        }
+
+        std::vector<std::string> manifest_lines;
+        manifest_lines.reserve(samples.size() + 1);
+        manifest_lines.emplace_back("class,raw_id,feature_path,mask_path,image_path");
+
+        std::vector<float> h_input(input_elems);
+        std::vector<float> h_output(pool2_elems);
+
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+
+        for (size_t idx = 0; idx < samples.size(); ++idx) {
+            const Sample &sample = samples[idx];
+            h_input = load_image_chw(sample.image_path, in_height, in_width);
+
+            CHECK_CUDA(cudaMemcpy(d_input, h_input.data(), input_elems * sizeof(float), cudaMemcpyHostToDevice));
+
+            CHECK_CUDNN(cudnnConvolutionForward(cudnn,
+                                               &alpha,
+                                               input_desc,
+                                               d_input,
+                                               conv1_filter_desc,
+                                               d_conv1_weights,
+                                               conv1_desc,
+                                               conv1_perf.algo,
+                                               d_workspace,
+                                               workspace_bytes,
+                                               &beta,
+                                               conv1_out_desc,
+                                               d_conv1_out));
+
+            CHECK_CUDNN(cudnnAddTensor(cudnn,
+                                       &alpha,
+                                       conv1_bias_desc,
+                                       d_conv1_bias,
+                                       &alpha,
+                                       conv1_out_desc,
+                                       d_conv1_out));
+
+            CHECK_CUDNN(cudnnActivationForward(cudnn,
+                                               relu_desc,
+                                               &alpha,
+                                               conv1_out_desc,
+                                               d_conv1_out,
+                                               &beta,
+                                               conv1_out_desc,
+                                               d_conv1_out));
+
+            CHECK_CUDNN(cudnnPoolingForward(cudnn,
+                                             pool_desc,
+                                             &alpha,
+                                             conv1_out_desc,
+                                             d_conv1_out,
+                                             &beta,
+                                             pool1_out_desc,
+                                             d_pool1_out));
+
+            CHECK_CUDNN(cudnnConvolutionForward(cudnn,
+                                               &alpha,
+                                               pool1_out_desc,
+                                               d_pool1_out,
+                                               conv2_filter_desc,
+                                               d_conv2_weights,
+                                               conv2_desc,
+                                               conv2_perf.algo,
+                                               d_workspace,
+                                               workspace_bytes,
+                                               &beta,
+                                               conv2_out_desc,
+                                               d_conv2_out));
+
+            CHECK_CUDNN(cudnnAddTensor(cudnn,
+                                       &alpha,
+                                       conv2_bias_desc,
+                                       d_conv2_bias,
+                                       &alpha,
+                                       conv2_out_desc,
+                                       d_conv2_out));
+
+            CHECK_CUDNN(cudnnActivationForward(cudnn,
+                                               relu_desc,
+                                               &alpha,
+                                               conv2_out_desc,
+                                               d_conv2_out,
+                                               &beta,
+                                               conv2_out_desc,
+                                               d_conv2_out));
+
+            CHECK_CUDNN(cudnnPoolingForward(cudnn,
+                                             pool_desc,
+                                             &alpha,
+                                             conv2_out_desc,
+                                             d_conv2_out,
+                                             &beta,
+                                             pool2_out_desc,
+                                             d_pool2_out));
+
+            CHECK_CUDA(cudaMemcpy(h_output.data(), d_pool2_out, pool2_elems * sizeof(float), cudaMemcpyDeviceToHost));
+
+            fs::path class_dir = fs::path(features_root) / sample.class_name;
+            fs::create_directories(class_dir);
+            fs::path feature_path = class_dir / (sample.stem + "_features.npy");
+
+            if (!write_npy(feature_path, h_output.data(), h_output.size(),
+                            {static_cast<size_t>(conv2_out_channels), static_cast<size_t>(pool2_height), static_cast<size_t>(pool2_width)})) {
+                std::cerr << "Failed to write feature map: " << feature_path << "\n";
+            }
+
+            std::ostringstream line;
+            line << sample.class_name << ','
+                 << sample.stem << ','
+                 << relative_or_absolute(feature_path, features_root) << ','
+                 << relative_or_absolute(sample.mask_path, processed_root) << ','
+                 << relative_or_absolute(sample.image_path, processed_root);
+            manifest_lines.push_back(line.str());
+
+            if ((idx + 1) % 50 == 0 || idx + 1 == samples.size()) {
+                std::cout << "Processed " << (idx + 1) << "/" << samples.size() << " feature maps.\n";
+            }
+        }
+
+        fs::path manifest_path = fs::path(features_root) / "manifest.csv";
+        std::ofstream manifest(manifest_path);
+        for (const auto &line : manifest_lines) {
+            manifest << line << '\n';
+        }
+        std::cout << "Feature manifest written to " << manifest_path << "\n";
+
+        // Cleanup
+        if (d_workspace) {
+            cudaFree(d_workspace);
+        }
+        cudaFree(d_pool2_out);
+        cudaFree(d_conv2_out);
+        cudaFree(d_pool1_out);
+        cudaFree(d_conv1_out);
+        cudaFree(d_input);
+        cudaFree(d_conv1_weights);
+        cudaFree(d_conv2_weights);
+        cudaFree(d_conv1_bias);
+        cudaFree(d_conv2_bias);
+
+        cudnnDestroyPoolingDescriptor(pool_desc);
+        cudnnDestroyActivationDescriptor(relu_desc);
+        cudnnDestroyTensorDescriptor(conv2_bias_desc);
+        cudnnDestroyTensorDescriptor(conv1_bias_desc);
+        cudnnDestroyConvolutionDescriptor(conv2_desc);
+        cudnnDestroyConvolutionDescriptor(conv1_desc);
+        cudnnDestroyFilterDescriptor(conv2_filter_desc);
+        cudnnDestroyFilterDescriptor(conv1_filter_desc);
+        cudnnDestroyTensorDescriptor(pool2_out_desc);
+        cudnnDestroyTensorDescriptor(conv2_out_desc);
+        cudnnDestroyTensorDescriptor(pool1_out_desc);
+        cudnnDestroyTensorDescriptor(conv1_out_desc);
+        cudnnDestroyTensorDescriptor(input_desc);
+        cudnnDestroy(cudnn);
+
+        CHECK_CUDA(cudaDeviceSynchronize());
+        std::cout << "Feature extraction completed successfully." << std::endl;
+        return 0;
+    } catch (const std::exception &ex) {
+        std::cerr << "Fatal error: " << ex.what() << std::endl;
+        return 1;
+    }
+}
