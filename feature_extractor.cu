@@ -165,7 +165,4 @@ std::string relative_or_absolute(const fs::path &target, const fs::path &base) {
 
 }  // namespace
 
-// NOTE: This is Part 1 of the feature extractor
-// Part 2 should contain the main() function with CUDA/cuDNN implementation
-
-// Merge both parts to create the complete feature_extractor_cudnn.cu file
+// This is Part 1 of the feature extractor
